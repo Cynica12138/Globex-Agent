@@ -12,6 +12,8 @@
 from __future__ import annotations
 
 import logging
+import hashlib
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -29,6 +31,23 @@ _KB_DESCRIPTION = (
     "Globex 跨境电商品类洞察知识库：各品类的热卖款型、关键属性判断口径、"
     "价格区间参考、避坑点，以及跨境到手价/免税额度/合规通则。"
 )
+
+
+def build_source_metadata(path: Path) -> dict:
+    """为本地知识文档生成可追溯元数据，不虚构法规生效日期。"""
+    content = path.read_bytes()
+    source_updated_at = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat()
+    return {
+        "source": path.name,
+        "source_type": "demo_reference",
+        "source_version": hashlib.sha256(content).hexdigest()[:12],
+        "source_updated_at": source_updated_at,
+        "effective_at": "not_applicable",
+        "expires_at": "not_applicable",
+        "freshness_policy": "manual_review",
+        "is_realtime": False,
+        "category": path.stem,
+    }
 
 
 def build_category_knowledge_base(settings: Settings) -> KnowledgeBase:
@@ -62,31 +81,39 @@ async def bootstrap_category_knowledge(
     knowledge_base: KnowledgeBase,
     knowledge_dir: Optional[Path] = None,
 ) -> int:
-    """把 knowledge/*.md 灌入知识库（幂等），返回入库文档数；失败仅告警返回 0。"""
+    """把 knowledge/*.md 增量灌入知识库，内容版本变化时重建；失败仅告警返回 0。"""
     directory = knowledge_dir or KNOWLEDGE_DIR
     try:
         await knowledge_base.ensure_collection()
-        existing = {doc.document_id for doc in await knowledge_base.list_documents()}
+        existing = {doc.document_id: doc for doc in await knowledge_base.list_documents()}
         parser, chunker = TextParser(), ApproxTokenChunker(chunk_size=512, overlap=50)
-        inserted = 0
+        upserted = 0
+        newly_inserted = 0
         for md_file in sorted(directory.glob("*.md")):
             document_id = md_file.stem
-            if document_id in existing:
+            metadata = build_source_metadata(md_file)
+            indexed = existing.get(document_id)
+            if indexed and indexed.metadata.get("source_version") == metadata["source_version"]:
                 continue
+            if indexed:
+                # 老索引没有版本字段，或文件内容已变化：整篇删除后重新切片与向量化。
+                await knowledge_base.delete_document(document_id)
+            else:
+                newly_inserted += 1
             sections = await parser.parse(str(md_file), filename=md_file.name)
             chunks = await chunker.chunk(sections)
             await knowledge_base.insert_document(
                 chunks=chunks,
                 document_id=document_id,
-                document_metadata={"source": md_file.name},
+                document_metadata=metadata,
             )
-            inserted += 1
+            upserted += 1
         logger.info(
-            "品类知识库就绪：新增 %d 篇，累计 %d 篇",
-            inserted,
-            len(existing) + inserted,
+            "品类知识库就绪：新增/更新 %d 篇，累计 %d 篇",
+            upserted,
+            len(existing) + newly_inserted,
         )
-        return inserted
+        return upserted
     except Exception as err:  # noqa: BLE001 —— 知识库不可用不阻塞启动
         logger.warning("品类知识库建库失败，category_insight 将不可用：%s", err)
         return 0

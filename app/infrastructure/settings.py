@@ -92,6 +92,11 @@ class Settings:
     # 本项目为个人 Demo：开启固定的变价/售罄/下架场景，用于展示时效事实校验。
     # 若将 API 暴露到公网，应显式设为 0。
     demo_scenarios_enabled: bool = True
+    # ---- 检索一、二阶段增强 ----
+    product_recall_top_n: int = 30  # 向量/BM25 各路候选深度，最终仍由请求 top_k 截断
+    hybrid_search_enabled: bool = True  # 向量 + BM25，经 RRF 融合
+    hybrid_rrf_k: int = 60  # RRF 平滑常数
+    category_kb_min_score: float = 0.35  # 低于阈值时明确拒答，不把弱相关片段当答案
 
 
 def load_settings() -> Settings:
@@ -168,4 +173,9 @@ def load_settings() -> Settings:
         queue_large_request_turns=int(os.getenv("QUEUE_LARGE_REQUEST_TURNS", "30")),
         demo_scenarios_enabled=os.getenv("DEMO_SCENARIOS_ENABLED", "1")
         not in ("0", "false", "False"),
+        product_recall_top_n=int(os.getenv("PRODUCT_RECALL_TOP_N", "30")),
+        hybrid_search_enabled=os.getenv("HYBRID_SEARCH_ENABLED", "1")
+        not in ("0", "false", "False"),
+        hybrid_rrf_k=int(os.getenv("HYBRID_RRF_K", "60")),
+        category_kb_min_score=float(os.getenv("CATEGORY_KB_MIN_SCORE", "0.35")),
     )

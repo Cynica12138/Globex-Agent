@@ -66,7 +66,11 @@ class SearchAgentFactory:
                 middlewares=self._resilience(),
             ),
             FunctionTool(
-                build_category_insight_tool(self._knowledge_base, self._bus),
+                build_category_insight_tool(
+                    self._knowledge_base,
+                    self._bus,
+                    min_score=self._settings.category_kb_min_score,
+                ),
                 is_read_only=True,
                 middlewares=self._resilience(),
             ),

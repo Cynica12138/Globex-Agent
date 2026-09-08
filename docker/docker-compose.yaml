@@ -28,6 +28,12 @@ services:
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-v4}
       QDRANT_URL: http://qdrant:6333
       QDRANT_COLLECTION: ${QDRANT_COLLECTION:-globex_products}
+      PRODUCT_RECALL_TOP_N: ${PRODUCT_RECALL_TOP_N:-30}
+      HYBRID_SEARCH_ENABLED: ${HYBRID_SEARCH_ENABLED:-1}
+      HYBRID_RRF_K: ${HYBRID_RRF_K:-60}
+      CATEGORY_KB_MIN_SCORE: ${CATEGORY_KB_MIN_SCORE:-0.35}
+      RERANKER_BASE_URL: ${RERANKER_BASE_URL-}
+      RERANKER_MODEL: ${RERANKER_MODEL:-BAAI/bge-reranker-base}
       # 四期：存储走 SQLite（落在 app-data 卷）；DATABASE_URL=file 退回 JSON 文件存储
       DATABASE_URL: ${DATABASE_URL:-sqlite+aiosqlite:////app/data/globex.db}
       # 四期：Redis 缓存（embedding 缓存 + 语义缓存 + 幂等键）；置空则全部缓存关闭
@@ -66,6 +72,12 @@ services:
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-v4}
       QDRANT_URL: http://qdrant:6333
       QDRANT_COLLECTION: ${QDRANT_COLLECTION:-globex_products}
+      PRODUCT_RECALL_TOP_N: ${PRODUCT_RECALL_TOP_N:-30}
+      HYBRID_SEARCH_ENABLED: ${HYBRID_SEARCH_ENABLED:-1}
+      HYBRID_RRF_K: ${HYBRID_RRF_K:-60}
+      CATEGORY_KB_MIN_SCORE: ${CATEGORY_KB_MIN_SCORE:-0.35}
+      RERANKER_BASE_URL: ${RERANKER_BASE_URL-}
+      RERANKER_MODEL: ${RERANKER_MODEL:-BAAI/bge-reranker-base}
       # 与 app 共一个 SQLite 文件（共享 app-data 卷）；WAL 已开，缓解双进程写锁竞争
       DATABASE_URL: ${DATABASE_URL:-sqlite+aiosqlite:////app/data/globex.db}
       REDIS_URL: ${REDIS_URL-redis://redis:6379/0}
@@ -104,6 +116,18 @@ services:
       - qdrant-data:/qdrant/storage
     restart: unless-stopped
 
+  # 可选 Cross-Encoder 精排服务；只在 --profile reranker 时启动。
+  # Apple Silicon 默认 arm64，x86_64 可覆盖 RERANKER_IMAGE=...:cpu-1.9。
+  reranker:
+    profiles: ["reranker"]
+    image: ${RERANKER_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:cpu-arm64-1.9}
+    command: ["--model-id", "${RERANKER_MODEL:-BAAI/bge-reranker-base}"]
+    ports:
+      - "8081:80"
+    volumes:
+      - reranker-data:/data
+    restart: unless-stopped
+
   frontend:
     image: node:22-alpine
     working_dir: /app
@@ -124,4 +148,5 @@ volumes:
   app-data:
   qdrant-data:
   redis-data:
+  reranker-data:
   frontend-modules:

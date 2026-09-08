@@ -29,7 +29,7 @@ def build_product_search_tool(usecase: CatalogSearchUseCase, bus: TradeEventBus)
         price_max_major: float | str | None = None,
         target_currency: str = "CNY",
     ) -> ToolChunk:
-        """检索跨境商品库（embedding+rerank 二阶段召回），返回 Top-K 商品卡 JSON。
+        """检索跨境商品库（向量+BM25 Hybrid 召回，可选 rerank），返回 Top-K 商品卡 JSON。
         传入 ship_to 时商品卡自动内联 landed_price 到手价明细（小计+运费+关税，统一折算 target_currency），
         无需另行计算价格。
 

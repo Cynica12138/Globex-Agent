@@ -4,12 +4,16 @@
 embedding 用确定性桩实现（关键词特征轴 + 余弦），向量索引用 Qdrant 本地嵌入模式，
 全程不依赖外部服务与 LLM。
 """
+import json
+
+import httpx
 import pytest
 
 from app.application.usecases.catalog_search import CatalogSearchUseCase
 from app.domain.catalog.ports.retrieval_ports import EmbeddingClient, Reranker
 from app.domain.catalog.product_search_spec import ProductSearchSpec
 from app.infrastructure.persistence.in_memory_repositories import InMemoryProductRepository
+from app.infrastructure.rerank.http_reranker import HttpReranker
 from app.infrastructure.settings import Settings
 from app.infrastructure.vector.index_bootstrap import bootstrap_product_index
 from app.infrastructure.vector.qdrant_product_index import QdrantProductIndex
@@ -41,6 +45,15 @@ class ReverseReranker(Reranker):
 
     async def rerank(self, query: str, documents: list[str]) -> list[float]:
         return [float(i) for i in range(len(documents))]
+
+
+class RecordingReranker(Reranker):
+    def __init__(self) -> None:
+        self.documents: list[str] = []
+
+    async def rerank(self, query: str, documents: list[str]) -> list[float]:
+        self.documents = documents
+        return [float(len(documents) - i) for i in range(len(documents))]
 
 
 def _settings(tmp_path) -> Settings:
@@ -75,9 +88,11 @@ class TestTwoStageRecall:
         repo, embedder, index = indexed
         usecase = CatalogSearchUseCase(repo, embedder=embedder, vector_index=index)
         result = await usecase.execute(ProductSearchSpec(normalized_query="露营灯 抗造"))
-        assert result["recall_strategy"] == "embedding_only"
+        assert result["recall_strategy"] == "hybrid_rrf"
         assert result["rerank_applied"] is False
         assert result["hits"][0]["product_id"] == "P1008", "露营灯应排第一"
+        assert result["retrieval_debug"]["recall_top_n"] == 30
+        assert result["retrieval_debug"]["bm25_candidates"] > 0
 
     async def test_rerank_applied_changes_order(self, indexed):
         repo, embedder, index = indexed
@@ -85,7 +100,7 @@ class TestTwoStageRecall:
             repo, embedder=embedder, vector_index=index, reranker=ReverseReranker(),
         )
         result = await usecase.execute(ProductSearchSpec(normalized_query="露营灯"))
-        assert result["recall_strategy"] == "embedding_rerank"
+        assert result["recall_strategy"] == "hybrid_rrf_rerank"
         assert result["rerank_applied"] is True
         # 反转桩生效：露营灯不再是第一位
         assert result["hits"][0]["product_id"] != "P1008"
@@ -94,9 +109,34 @@ class TestTwoStageRecall:
         repo, _, index = indexed
         usecase = CatalogSearchUseCase(repo, embedder=BrokenEmbeddingClient(), vector_index=index)
         result = await usecase.execute(ProductSearchSpec(normalized_query="露营灯 抗造"))
-        assert result["recall_strategy"] == "keyword_2gram"
-        assert result["hits"], "关键词降级仍应有召回"
+        assert result["recall_strategy"] == "bm25"
+        assert result["hits"], "BM25 降级仍应有召回"
         assert result["hits"][0]["product_id"] == "P1008"
+
+    async def test_bm25_works_without_vector_dependencies(self):
+        result = await CatalogSearchUseCase(InMemoryProductRepository()).execute(
+            ProductSearchSpec(normalized_query="碳纤维 登山杖"),
+        )
+        assert result["recall_strategy"] == "bm25"
+        assert result["hits"][0]["product_id"] == "P1047"
+
+    async def test_hard_constraints_run_before_reranker(self, indexed):
+        repo, embedder, index = indexed
+        reranker = RecordingReranker()
+        result = await CatalogSearchUseCase(
+            repo, embedder=embedder, vector_index=index, reranker=reranker,
+        ).execute(ProductSearchSpec(normalized_query="行李箱", price_max_major=500.0))
+        assert result["rerank_applied"] is True
+        assert all("TrailOx 20寸登机行李箱" not in document for document in reranker.documents)
+        assert any(item["product_id"] == "P1002" for item in result["filtered_out"])
+
+    async def test_embedding_only_baseline_can_disable_hybrid(self, indexed):
+        repo, embedder, index = indexed
+        result = await CatalogSearchUseCase(
+            repo, embedder=embedder, vector_index=index, hybrid_enabled=False,
+        ).execute(ProductSearchSpec(normalized_query="露营灯"))
+        assert result["recall_strategy"] == "embedding_only"
+        assert result["retrieval_debug"]["bm25_candidates"] == 0
 
     async def test_price_cap_hard_filter(self, indexed):
         repo, embedder, index = indexed
@@ -187,3 +227,20 @@ class TestTwoStageRecall:
         hits = result_event.payload["hits"]
         assert hits and hits[0]["product_id"] == "P1008"
         assert hits[0]["landed_price"]["currency"] == "USD"
+
+
+class TestHttpReranker:
+    async def test_uses_tei_texts_protocol_and_accepts_list_response(self, tmp_path):
+        async def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            assert request.url.path == "/rerank"
+            assert body == {"query": "露营灯", "texts": ["文档一", "文档二"]}
+            return httpx.Response(
+                200,
+                json=[{"index": 1, "score": 0.9}, {"index": 0, "score": 0.2}],
+            )
+
+        settings = _settings(tmp_path)
+        object.__setattr__(settings, "reranker_base_url", "http://reranker.test")
+        reranker = HttpReranker(settings, transport=httpx.MockTransport(handler))
+        assert await reranker.rerank("露营灯", ["文档一", "文档二"]) == [0.2, 0.9]

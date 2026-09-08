@@ -2,8 +2,8 @@
 """检索基础设施端口：EmbeddingClient / ProductVectorIndex / Reranker
 
 Domain 不关心实现：Infrastructure 提供 OpenAI 兼容 embedding、Qdrant 索引、HTTP reranker。
-UseCase 通过这三个端口完成"embed → 向量召回 → rerank"二阶段召回，
-任一环节不可用时由 UseCase 负责降级（关键词召回 / 跳过精排）。
+UseCase 通过这些端口完成"向量 + BM25 → RRF → rerank"二阶段召回，
+任一外部环节不可用时由 UseCase 负责降级（BM25 / 跳过精排）。
 """
 from __future__ import annotations
 

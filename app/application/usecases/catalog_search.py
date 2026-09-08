@@ -1,15 +1,15 @@
 # -*- coding: utf-8 -*-
 """CatalogSearchUseCase
 
-商品检索核心 UseCase，对齐参考实现五步流程：
-    1. EmbeddingClient 把 normalized_query 向量化
-    2. ProductVectorIndex.search(top_n) 拿候选 product_id（Qdrant，COSINE）
-    3. ProductRepository.find_by_ids 还原 Product 聚合
-    4. Reranker 精排取 top_k；失败/未配置降级按向量分排序（rerank_applied=false）
-    5. 组装商品卡 JSON；命中 ship_to 时内联到手价（小计+运费+关税，统一目标币种）
+商品检索核心 UseCase：
+    1. 向量召回与本地 BM25 各取一批候选
+    2. RRF 融合两路排名，避免直接混加不可比的分数
+    3. 先执行上下架 / 配送 / 价格硬约束
+    4. 可选 Cross-Encoder Reranker 精排；不可用时保留 RRF 排序
+    5. 组装商品卡 JSON；命中 ship_to 时内联到手价
 
 降级链（recall_strategy 如实标注）：
-    embedding_rerank → embedding_only → keyword_2gram（embedding 服务异常时兜底）
+    hybrid_rrf_rerank → hybrid_rrf → embedding_only → bm25
 
 计价收敛设计：到手价在检索链路内联计算（TariffSchedule 规则内核），
 不给 Agent 单独暴露比价/运费工具，减少不必要的工具调用轮次。
@@ -20,6 +20,9 @@
 from __future__ import annotations
 
 import logging
+import math
+import re
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
@@ -37,8 +40,14 @@ from app.domain.shipping.tariff_schedule import TariffSchedule
 
 logger = logging.getLogger(__name__)
 
-# 一阶段召回候选数（> top_k，给精排留空间）
-_RECALL_TOP_N = 8
+# 一阶段召回候选数（显著大于最终 top_k，给融合与精排留空间）
+_RECALL_TOP_N = 30
+
+# RRF 常用平滑常数，降低某一路第一名对融合结果的过度支配
+_RRF_K = 60
+
+# 商品卡都很短，标准 b=0.75 会过度奖励更短但缺关键词的文档；评测语料上取 0.6。
+_BM25_B = 0.6
 
 # 被硬约束挡掉的候选回传条数上限（只回摘要，避免上下文膨胀）
 _FILTERED_OUT_LIMIT = 3
@@ -82,14 +91,14 @@ class ProductCard:
         return card
 
 
-def tokenize(text: str) -> set[str]:
-    """极简分词：空格切词 + 中文连续段落的 2-gram（关键词降级召回用）。"""
-    terms: set[str] = set()
-    for chunk in text.lower().split():
-        terms.add(chunk)
-        # 对含 CJK 的 chunk 补 2-gram，缓解中文无空格问题
-        if any("\u4e00" <= ch <= "\u9fff" for ch in chunk) and len(chunk) >= 2:
-            terms.update(chunk[i : i + 2] for i in range(len(chunk) - 1))
+def tokenize(text: str) -> list[str]:
+    """轻量中英分词：英文/数字按词，中文保留连续片段并补 2-gram。"""
+    terms: list[str] = []
+    for chunk in re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]+", text.lower()):
+        terms.append(chunk)
+        # 两字词本身就是完整 token，不再重复加入同一个 2-gram。
+        if any("\u4e00" <= ch <= "\u9fff" for ch in chunk) and len(chunk) > 2:
+            terms.extend(chunk[i : i + 2] for i in range(len(chunk) - 1))
     return terms
 
 
@@ -101,55 +110,83 @@ class CatalogSearchUseCase:
         vector_index: Optional[ProductVectorIndex] = None,
         reranker: Optional[Reranker] = None,
         tariff_schedule: Optional[TariffSchedule] = None,
+        recall_top_n: int = _RECALL_TOP_N,
+        hybrid_enabled: bool = True,
+        rrf_k: int = _RRF_K,
     ) -> None:
         self._product_repo = product_repo
         self._embedder = embedder
         self._vector_index = vector_index
         self._reranker = reranker
         self._tariff = tariff_schedule or TariffSchedule(rates=ExchangeRateTable())
+        self._recall_top_n = max(1, recall_top_n)
+        self._hybrid_enabled = hybrid_enabled
+        self._rrf_k = max(1, rrf_k)
 
     async def execute(self, spec: ProductSearchSpec) -> dict:
         observed_at = datetime.now(timezone.utc).isoformat()
+        vector_scored: list[tuple[float, Product]] = []
+        bm25_scored: list[tuple[float, Product]] = []
         scored: list[tuple[float, Product]] = []
-        recall_strategy = "keyword_2gram"
+        recall_strategy = "bm25"
         rerank_applied = False
 
         if self._embedder is not None and self._vector_index is not None:
             try:
-                scored = await self._vector_recall(spec)
+                vector_scored = await self._vector_recall(spec)
                 recall_strategy = "embedding_only"
             except Exception as err:  # noqa: BLE001 —— 召回基建异常必须降级而非失败
-                logger.warning("向量召回不可用，降级关键词召回：%s", err)
-                scored = []
+                logger.warning("向量召回不可用，降级 BM25 召回：%s", err)
+                vector_scored = []
 
-        if recall_strategy == "embedding_only" and scored:
-            # 二阶段精排；失败降级按向量分排序
-            try:
-                scored = await self._rerank(spec, scored)
-                recall_strategy = "embedding_rerank"
-                rerank_applied = True
-            except Exception as err:  # noqa: BLE001
-                logger.warning("rerank 不可用，按向量分排序：%s", err)
-        elif not scored:
-            scored = await self._keyword_recall(spec)
-            recall_strategy = "keyword_2gram"
+        if self._hybrid_enabled:
+            bm25_scored = await self._bm25_recall(spec)
+            if vector_scored:
+                scored = self._rrf_fuse(vector_scored, bm25_scored)
+                recall_strategy = "hybrid_rrf"
+            else:
+                scored = bm25_scored
+                recall_strategy = "bm25"
+        else:
+            scored = vector_scored
+            if not scored:
+                bm25_scored = await self._bm25_recall(spec)
+                scored = bm25_scored
+                recall_strategy = "bm25"
 
-        # ship_to / 价格硬约束过滤 + top_k 截断（硬约束走结构化过滤，不交给模型）
-        filtered: list[tuple[float, Product]] = []
+        # 硬约束先于精排：不把下架、不可配送、超预算商品送给外部 Reranker。
+        eligible: list[tuple[float, Product]] = []
         filtered_out: list[dict] = []
         for score, product in scored:
             reason = self._reject_reason(product, spec)
             if reason is None:
-                filtered.append((score, product))
+                eligible.append((score, product))
             elif len(filtered_out) < _FILTERED_OUT_LIMIT:
                 filtered_out.append(self._to_rejected(product, spec, reason))
 
-        hits = [self._to_card(score, product, spec) for score, product in filtered[: spec.top_k]]
+        if eligible and self._reranker is not None:
+            try:
+                eligible = await self._rerank(spec, eligible)
+                recall_strategy = (
+                    "hybrid_rrf_rerank" if recall_strategy == "hybrid_rrf" else "embedding_rerank"
+                )
+                rerank_applied = True
+            except Exception as err:  # noqa: BLE001
+                logger.warning("rerank 不可用，保留一阶段排序：%s", err)
+
+        hits = [self._to_card(score, product, spec) for score, product in eligible[: spec.top_k]]
         result = {
             "hits": [card.to_dict() for card in hits],
-            "total_candidates": len(filtered),
+            "total_candidates": len(eligible),
             "recall_strategy": recall_strategy,
             "rerank_applied": rerank_applied,
+            "retrieval_debug": {
+                "recall_top_n": self._recall_top_n,
+                "vector_candidates": len(vector_scored),
+                "bm25_candidates": len(bm25_scored),
+                "fused_candidates": len(scored),
+                "eligible_candidates": len(eligible),
+            },
             # 明确这是本地模拟交易事实，不伪装成真实电商平台实时价。
             "data_mode": "demo",
             "observed_at": observed_at,
@@ -191,7 +228,7 @@ class CatalogSearchUseCase:
 
     async def _vector_recall(self, spec: ProductSearchSpec) -> list[tuple[float, Product]]:
         embedding = await self._embedder.embed(spec.normalized_query)
-        vector_hits = await self._vector_index.search(embedding, top_n=_RECALL_TOP_N)
+        vector_hits = await self._vector_index.search(embedding, top_n=self._recall_top_n)
         products = await self._product_repo.find_by_ids([hit.product_id for hit in vector_hits])
         by_id = {product.product_id: product for product in products}
         return [
@@ -218,29 +255,59 @@ class CatalogSearchUseCase:
         reranked.sort(key=lambda pair: pair[0], reverse=True)
         return reranked
 
-    # ---- 兜底：关键词召回 ----
+    # ---- 一阶段：轻量 BM25 与 RRF 融合 ----
 
-    async def _keyword_recall(self, spec: ProductSearchSpec) -> list[tuple[float, Product]]:
+    async def _bm25_recall(self, spec: ProductSearchSpec) -> list[tuple[float, Product]]:
+        products = await self._product_repo.list_all()
+        if not products:
+            return []
         query_terms = tokenize(spec.normalized_query)
+        if spec.category:
+            query_terms.extend(tokenize(spec.category))
+        if not query_terms:
+            return []
+
+        documents = [tokenize(product.searchable_text()) for product in products]
+        doc_freq = Counter(term for terms in documents for term in set(terms))
+        avg_len = sum(len(terms) for terms in documents) / len(documents)
+        query_freq = Counter(query_terms)
         candidates: list[tuple[float, Product]] = []
-        for product in await self._product_repo.list_all():
-            score = self._keyword_score(query_terms, product, spec)
+        for product, terms in zip(products, documents):
+            frequencies = Counter(terms)
+            score = 0.0
+            for term, qf in query_freq.items():
+                tf = frequencies.get(term, 0)
+                if not tf:
+                    continue
+                idf = math.log(1.0 + (len(documents) - doc_freq[term] + 0.5) / (doc_freq[term] + 0.5))
+                norm = tf + 1.5 * (1.0 - _BM25_B + _BM25_B * len(terms) / max(avg_len, 1.0))
+                score += idf * (tf * 2.5 / norm) * qf
+            # 中文商品 query 往往是多个短属性的 AND 意图；协调因子抑制只重复命中
+            # 热门品类词、却遗漏关键属性词的短文档。
+            matched_terms = sum(1 for term in query_freq if frequencies.get(term, 0))
+            score *= (matched_terms / len(query_freq)) ** 2
+            if spec.category and spec.category in product.category:
+                score += 1.0
             if score > 0:
                 candidates.append((score, product))
-        candidates.sort(key=lambda pair: pair[0], reverse=True)
-        return candidates
+        candidates.sort(key=lambda pair: (-pair[0], pair[1].product_id))
+        return candidates[: self._recall_top_n]
 
-    @staticmethod
-    def _keyword_score(query_terms: set[str], product: Product, spec: ProductSearchSpec) -> float:
-        doc_terms = tokenize(product.searchable_text())
-        matched = query_terms & doc_terms
-        if not matched:
-            return 0.0
-        score = float(len(matched))
-        # 品类槽位命中加权，让"槽位过滤"优于全文命中
-        if spec.category and spec.category in product.category:
-            score += 3.0
-        return score
+    def _rrf_fuse(
+        self,
+        vector_scored: list[tuple[float, Product]],
+        bm25_scored: list[tuple[float, Product]],
+    ) -> list[tuple[float, Product]]:
+        """Reciprocal Rank Fusion：只使用名次，避免向量分与 BM25 分尺度不一致。"""
+        products: dict[str, Product] = {}
+        scores: Counter[str] = Counter()
+        for ranking in (vector_scored, bm25_scored):
+            for rank, (_, product) in enumerate(ranking, start=1):
+                products[product.product_id] = product
+                scores[product.product_id] += 1.0 / (self._rrf_k + rank)
+        fused = [(score, products[product_id]) for product_id, score in scores.items()]
+        fused.sort(key=lambda pair: (-pair[0], pair[1].product_id))
+        return fused[: self._recall_top_n]
 
     # ---- 商品卡组装（含到手价内联）----
 

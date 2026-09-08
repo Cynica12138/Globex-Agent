@@ -6,18 +6,17 @@
 
 用法（项目根目录执行）：
 
-    # 默认档（有 embedding 凭据就走向量+精排，否则自动降级）
+    # 默认档（向量 + BM25 + RRF，可选精排；依赖异常自动降级）
     uv run python scripts/eval/run_product_recall.py
 
-    # 三档降级链对比：量化"降级到底损失多少召回质量"
+    # 五档对比：量化向量、BM25、Hybrid、Reranker 各自贡献
     uv run python scripts/eval/run_product_recall.py --compare-strategies
 
     # 无凭据也能跑：纯关键词档，适合 CI
-    uv run python scripts/eval/run_product_recall.py --strategy keyword_2gram
+    uv run python scripts/eval/run_product_recall.py --strategy bm25
 
-关于 K 的选择（重要）：`catalog_search._RECALL_TOP_N = 8` 限制了向量召回只取 8 个候选，
-因此向量档的 Recall@K 在 K>8 时**不可能再涨**，而关键词档是全库打分无上限。
-在 K=10 上对比两档等于系统性地偏袒关键词档，故默认 K=8。
+一阶段默认候选深度为 30，最终指标仍按 K=8 计算；这样 Recall@8 不再被候选池上限卡死，
+也能观察 RRF 与 Reranker 对排序指标的真实影响。
 """
 from __future__ import annotations
 
@@ -55,7 +54,13 @@ from scripts.eval.metrics import (  # noqa: E402
 )
 
 _DATASET = Path("eval/product_recall.jsonl")
-_STRATEGIES = ("embedding_rerank", "embedding_only", "keyword_2gram")
+_STRATEGIES = (
+    "hybrid_rrf_rerank",
+    "hybrid_rrf",
+    "embedding_rerank",
+    "embedding_only",
+    "bm25",
+)
 
 
 def load_dataset(path: Path) -> list[dict]:
@@ -75,8 +80,8 @@ async def build_usecase(strategy: str) -> tuple[CatalogSearchUseCase, InMemoryPr
     评测因此测的是真链路，不是为评测另写的一套。
     """
     repo = InMemoryProductRepository()
-    if strategy == "keyword_2gram":
-        return CatalogSearchUseCase(repo), repo, "keyword_2gram"
+    if strategy == "bm25":
+        return CatalogSearchUseCase(repo), repo, "bm25"
 
     settings = load_settings()
     embedder = OpenAIEmbeddingClient(settings)
@@ -86,14 +91,15 @@ async def build_usecase(strategy: str) -> tuple[CatalogSearchUseCase, InMemoryPr
         print("  [warn] 向量建库失败，本档实际会降级到关键词召回")
 
     reranker = None
-    if strategy == "embedding_rerank":
+    if strategy in ("embedding_rerank", "hybrid_rrf_rerank"):
         if settings.reranker_base_url:
             reranker = HttpReranker(settings)
         else:
-            print("  [warn] 未配置 RERANKER_BASE_URL，embedding_rerank 档实际等价于 embedding_only")
+            print(f"  [warn] 未配置 RERANKER_BASE_URL，{strategy} 档不会应用精排")
     return (
         CatalogSearchUseCase(
             repo, embedder=embedder, vector_index=vector_index, reranker=reranker,
+            hybrid_enabled=strategy.startswith("hybrid_rrf"),
         ),
         repo,
         strategy,
@@ -250,9 +256,9 @@ def render_report(
 async def main() -> None:
     parser = argparse.ArgumentParser(description="商品检索召回评测")
     parser.add_argument("--dataset", default=str(_DATASET))
-    parser.add_argument("--top-k", type=int, default=8, help="默认 8：向量召回深度上限即 8")
-    parser.add_argument("--strategy", choices=_STRATEGIES, default="embedding_rerank")
-    parser.add_argument("--compare-strategies", action="store_true", help="三档降级链对比")
+    parser.add_argument("--top-k", type=int, default=8, help="最终结果截断深度，默认 8")
+    parser.add_argument("--strategy", choices=_STRATEGIES, default="hybrid_rrf_rerank")
+    parser.add_argument("--compare-strategies", action="store_true", help="五档检索策略对比")
     parser.add_argument("--min-recall", type=float, default=0.75)
     parser.add_argument("--min-mrr", type=float, default=0.65)
     parser.add_argument("--min-ndcg", type=float, default=0.70)

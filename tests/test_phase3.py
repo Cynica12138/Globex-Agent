@@ -76,6 +76,22 @@ class TestCategoryKnowledge:
         assert again == 0
         assert len(await knowledge_base.list_documents()) == 2
 
+    async def test_bootstrap_reindexes_changed_document(self, knowledge_base, tmp_path):
+        path = tmp_path / "knowledge" / "outdoor.md"
+        before = {
+            doc.document_id: doc.metadata["source_version"]
+            for doc in await knowledge_base.list_documents()
+        }
+        path.write_text("# 户外\n露营灯新增关注显色指数。", encoding="utf-8")
+        changed = await bootstrap_category_knowledge(knowledge_base, knowledge_dir=path.parent)
+        after = {
+            doc.document_id: doc.metadata["source_version"]
+            for doc in await knowledge_base.list_documents()
+        }
+        assert changed == 1
+        assert before["outdoor"] != after["outdoor"]
+        assert len(after) == 2
+
     async def test_insight_tool_returns_relevant_chunk(self, knowledge_base):
         bus = TradeEventBus()
         queue = bus.subscribe("anonymous")
@@ -86,7 +102,21 @@ class TestCategoryKnowledge:
         assert payload["insights"], "应有知识命中"
         assert "免税额度" in payload["insights"][0]["content"]
         assert payload["insights"][0]["source"].endswith(".md")
+        assert payload["answerable"] is True
+        assert payload["confidence"] in ("medium", "high")
+        assert payload["insights"][0]["source_version"] != "unknown"
+        assert payload["insights"][0]["source_updated_at"] != "unknown"
+        assert payload["insights"][0]["is_realtime"] is False
         assert queue.qsize() == 2  # tool.invoke + tool.result
+
+    async def test_insight_tool_refuses_low_confidence_evidence(self, knowledge_base):
+        tool = build_category_insight_tool(knowledge_base, TradeEventBus(), min_score=0.35)
+        response = await tool(question="量子芯片怎么挑", top_k=2)
+        payload = json.loads(response.content[0].text)
+        assert payload["answerable"] is False
+        assert payload["confidence"] == "low"
+        assert payload["insights"] == []
+        assert payload["reason"] == "no_reliable_local_evidence"
 
     async def test_insight_tool_degrades_when_kb_broken(self):
         class BrokenKnowledgeBase:

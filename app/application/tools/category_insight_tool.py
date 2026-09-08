@@ -29,7 +29,11 @@ def _chunk_text(content) -> str:
     return str(content)
 
 
-def build_category_insight_tool(knowledge_base: KnowledgeBase, bus: TradeEventBus):
+def build_category_insight_tool(
+    knowledge_base: KnowledgeBase,
+    bus: TradeEventBus,
+    min_score: float = 0.35,
+):
     async def category_insight_tool(question: str, top_k: int = 3) -> ToolChunk:
         """查询品类洞察知识库：热卖款型、关键属性判断口径、价格区间、避坑点、跨境通则。
 
@@ -57,18 +61,33 @@ def build_category_insight_tool(knowledge_base: KnowledgeBase, bus: TradeEventBu
                 state=ToolResultState.ERROR,
             )
 
-        insights = [
-            {
-                "content": _chunk_text(item.chunk.content),
-                "source": item.chunk.metadata.get("source", item.document_id)
-                if item.chunk.metadata
-                else item.document_id,
-                "score": round(item.score, 4),
-            }
-            for item in results
-        ]
+        insights = []
+        for item in results:
+            if item.score < min_score:
+                continue
+            metadata = item.chunk.metadata or {}
+            insights.append(
+                {
+                    "content": _chunk_text(item.chunk.content),
+                    "source": metadata.get("source", item.document_id),
+                    "score": round(item.score, 4),
+                    "source_type": metadata.get("source_type", "demo_reference"),
+                    "source_version": metadata.get("source_version", "unknown"),
+                    "source_updated_at": metadata.get("source_updated_at", "unknown"),
+                    "effective_at": metadata.get("effective_at", "not_applicable"),
+                    "expires_at": metadata.get("expires_at", "not_applicable"),
+                    "freshness_policy": metadata.get("freshness_policy", "manual_review"),
+                    "is_realtime": bool(metadata.get("is_realtime", False)),
+                },
+            )
+
+        best_score = max((item["score"] for item in insights), default=0.0)
+        confidence = "high" if best_score >= 0.75 else ("medium" if insights else "low")
         payload = {
             "insights": insights,
+            "answerable": bool(insights),
+            "confidence": confidence,
+            "min_score": min_score,
             "data_mode": "demo_reference",
             "observed_at": datetime.now(timezone.utc).isoformat(),
             "freshness_warning": (
@@ -76,10 +95,20 @@ def build_category_insight_tool(knowledge_base: KnowledgeBase, bus: TradeEventBu
                 "关税、免税额度、禁限运和航空规则需通过联网工具或官方源复核。"
             ),
         }
+        if not insights:
+            payload["reason"] = "no_reliable_local_evidence"
+            payload["suggested_action"] = (
+                "请缩小或改写问题；若涉及实时法规，应调用联网搜索并优先核对官方来源。"
+            )
         bus.publish(
             session_id,
             "tool.result",
-            {"tool": "category_insight_tool", "hit_count": len(insights)},
+            {
+                "tool": "category_insight_tool",
+                "hit_count": len(insights),
+                "answerable": bool(insights),
+                "confidence": confidence,
+            },
         )
         return ToolChunk(
             content=[TextBlock(type="text", text=json.dumps(payload, ensure_ascii=False))],

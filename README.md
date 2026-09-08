@@ -5,8 +5,8 @@
 - **MainAgent**（CommerceConcierge）：超级框总调度，**持有全部业务工具可直接单干**；
   内置 Task 计划四件套管理任务清单；满足"可并行 / 上下文隔离 / 链深"任一条件时经 `task_dispatch` 派发子 Agent；
   发现稳定偏好时经 `remember_preference_tool` 写入长期记忆
-- **SearchAgent**（CatalogSearchAgent）：商品检索专家，query 改写 → **embedding+rerank 二阶段召回**（Qdrant），
-    失败逐级降级（embedding_only → keyword_2gram）；可选 web_search 兜底跨境政策/关税问答
+- **SearchAgent**（CatalogSearchAgent）：商品检索专家，query 改写 → **向量 + BM25 + RRF Hybrid 召回**（Qdrant）
+  → 可选 Cross-Encoder Reranker；失败降级到 Hybrid / 单路 BM25；可选 web_search 兜底政策问答
 - **TradeAgent**（OrderTradeAgent）：下单交易专家（订单创建 / 查询 / 取消，买家身份由 ShoppingContext 注入）
 
 分期设计脉络、关键取舍与踩坑记录见 [docs/设计演进记录.md](docs/设计演进记录.md)。
@@ -65,13 +65,14 @@ docker/                # docker-compose.yaml（app + worker + qdrant + redis + f
   广播带 `origin` 标识以跳过自己发的消息（否则事件会回环投递两次）
 - **主 Agent 单干优先**：MainAgent 与子 Agent 持有同一批业务工具（`build_tools()` 复用），
   只在"可并行 / 上下文隔离 / 调用链深"时派发
-- **二阶段召回**：embed → Qdrant 向量召回 topN → rerank 精排 topK；降级链
-  embedding_rerank → embedding_only → keyword_2gram，`recall_strategy` 如实标注；
+- **二阶段召回**：Qdrant 向量与轻量 BM25 各召回 top30 → RRF 融合 → 硬约束过滤
+  → rerank 精排 topK；降级链 `hybrid_rrf_rerank → hybrid_rrf → embedding_only → bm25`，
+  `recall_strategy` 与各阶段候选数如实标注；
   价格等硬约束走工具参数结构化过滤（price_max_major），不交给模型
 - **过滤可观测**：被 ship_to / 价格上限挡掉的候选以 `filtered_out`（含 reason）回传，
   让模型能区分"库里没有"与"有但不满足约束"，避免把超预算商品答成"没有这个商品"
 - **品类洞察 RAG**：`category_insight_tool` 查 `rag.KnowledgeBase`（选购口径、价格区间、避坑点、
-  跨境通则），先给判断标准再给商品清单
+  跨境通则），知识片段携带来源、内容版本、更新时间与实时性声明；低于置信阈值时明确拒答
 - **上下文工程**：ContextConfig 定制压缩（trigger_ratio 0.75 / reserve_ratio 0.15 + 工具结果截断），
   摘要落 AgentState.summary 并推送 `context.compressed` 事件；配合 Token 预算中间件收口单轮开销
 - **工具韧性**：ToolResilienceMiddleware 分级超时 + 按工具熔断（closed→open→half_open），
@@ -135,6 +136,7 @@ uv run pytest                          # 全量单测：domain / 召回 / SQL �
 uv run python scripts/smoke_e2e.py    # 端到端冒烟：WS 订阅 + 提交意图，实时打印事件流
 uv run python scripts/verify_parallel.py   # 并行验证：同轮多派 vs 串行的墙钟耗时与事件重叠数对比
 uv run python scripts/eval_regression.py   # 评测回归：13 条 case，LLM judge 按 P0/P1/P2 Rubric 打分出报告
+uv run python scripts/eval/run_product_recall.py --compare-strategies  # BM25/向量/Hybrid/Reranker 对照
 ```
 
 评测 case 支持 `prior_context` 字段：把跨会话已成立的事实（如上一 case 写入的长期偏好）告知 judge，
@@ -147,6 +149,16 @@ export LLM_BASE_URL=<网关地址> LLM_API_KEY=<密钥>   # 敏感配置走环�
 docker compose -f docker/docker-compose.yaml up -d --build   # app + qdrant + frontend
 # 前端 http://localhost:5173  后端 http://localhost:8000
 ```
+
+可选启用本地 Cross-Encoder Reranker（首次启动会下载模型）：
+
+```bash
+export RERANKER_BASE_URL=http://reranker
+docker compose -f docker/docker-compose.yaml --profile reranker up -d --build
+```
+
+Compose 默认使用 Apple Silicon 的 `cpu-arm64-1.9` 镜像；x86_64 主机额外设置
+`RERANKER_IMAGE=ghcr.io/huggingface/text-embeddings-inference:cpu-1.9`。
 
 本地开发不依赖 Docker：QDRANT_URL 置空时自动用 qdrant-client 本地嵌入模式（单进程文件锁，
 多实例/生产请用 compose 的 Qdrant 服务端）。

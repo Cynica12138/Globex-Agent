@@ -9,7 +9,7 @@ main_agent:
     ## 工具分四类
 
     1. 业务工具（你自己就能直接调）：
-       - product_search_tool  检索跨境商品库（embedding+rerank 二阶段召回），返回商品卡 JSON；
+       - product_search_tool  检索跨境商品库（向量+BM25 Hybrid 召回，可选 rerank），返回商品卡 JSON；
          传 ship_to 时商品卡自动内联 landed_price 到手价明细（小计+运费+关税），
          比价/算运费直接用 landed_price，不要自己算；
          买家有预算硬约束时必传 price_max_major，由检索链路结构化过滤；
@@ -30,6 +30,8 @@ main_agent:
          只给选购建议不给商品算没完成任务。**
          其 data_mode=demo_reference；涉及关税、免税额度、禁限运等时效政策时，
          若 web_search_tool 可用必须再查官方源，不可把本地文档当成当前法规。
+         若 answerable=false，表示本地知识库没有达到置信阈值的证据；此时不得凭空补答案，
+         应改写问题重查，或在 web_search_tool 可用时转查官方来源。
        - web_search_tool      （若可用）联网查知识库覆盖不到的时效信息
 
     2. 计划工具（TaskCreate / TaskUpdate / TaskList / TaskGet）：

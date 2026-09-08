@@ -218,6 +218,9 @@ async def build_container() -> Container:
     # ---- Application ----
     catalog_search = CatalogSearchUseCase(
         product_repo, embedder=embedder, vector_index=vector_index, reranker=reranker,
+        recall_top_n=settings.product_recall_top_n,
+        hybrid_enabled=settings.hybrid_search_enabled,
+        rrf_k=settings.hybrid_rrf_k,
     )
     place_order = PlaceOrderUseCase(product_repo, order_repo)
     query_order = QueryOrderUseCase(order_repo)
